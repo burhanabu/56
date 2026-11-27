@@ -1,0 +1,17 @@
+{
+  "Engine": "auto",
+  "DefaultVoice": "adam",
+  "Speed": 0.95,
+  "AutoAnswer": true,
+  "ExtraVoices": { "bella": "af_bella", "michael": "am_michael" },
+  "Phrases": [
+    { "Label": "Yes",     "Text": "Yes.",                         "Voice": "adam",    "Cat": "Answers" },
+    { "Label": "No",      "Text": "No, thank you.",               "Voice": "adam",    "Cat": "Answers" },
+    { "Label": "One moment", "Text": "One moment please.",        "Voice": "jessica", "Cat": "Answers" },
+    { "Label": "Repeat",  "Text": "Could you please repeat that?", "Voice": "adam",   "Cat": "Answers" },
+    { "Label": "Hello",   "Text": "Hello, how are you?",          "Voice": "sarah",   "Cat": "Greetings" }
+  ],
+  "Rules": [
+    { "Keywords": [ "date of birth", "birthday", "born" ], "Say": "My date of birth is January first, nineteen ninety.", "Voice": "adam", "CooldownSec": 4 }
+  ]
+}

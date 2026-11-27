@@ -1,0 +1,1861 @@
+using NAudio.Wave;
+using SIPSorcery.Media;
+using SIPSorcery.Net;
+using SIPSorcery.SIP.App;
+using SIPSorcery.SIP;
+using SIPSorceryMedia.Abstractions;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Vosk;
+
+// ===== Program.cs =====
+public class PhraseCfg
+{
+    public string Label { get; set; } = "";
+    public string Text { get; set; } = "";
+    public string Voice { get; set; } = "adam";
+    public string Cat { get; set; } = "";
+}
+
+public class RuleCfg
+{
+    public string[] Keywords { get; set; } = new string[0];   // customer (Line 2) ye lafz bole
+    public string Say { get; set; } = "";                      // ye awaaz SIRF Line 1 ko jaye
+    public string Voice { get; set; } = "adam";
+    public int CooldownSec { get; set; } = 4;
+}
+
+public class AppConfig
+{
+    public string Server { get; set; } = "";
+    public string User { get; set; } = "";
+    public string Password { get; set; } = "";
+    public string Prefix { get; set; } = "";
+    public bool UsePrefix { get; set; } = true;          // true: app prefix khud lagati hai; false: number poora khud likhein
+    public string[] Prefixes { get; set; } = new string[0]; // yaad rakhe hue prefixes
+    public string[] Accounts { get; set; } = new string[0];
+    public string AppName { get; set; } = "Mera Dialer";
+    public string LogoFile { get; set; } = "logo.png";
+    public string AccentColor { get; set; } = "#1F6FEB";
+    public string MicName { get; set; } = "";
+    public string SpeakerName { get; set; } = "";
+
+    // ---- Phrase Pad / TTS / Auto-answer ----
+    public string ElevenLabsKey { get; set; } = "";                 // khali = Windows ki apni awaaz (offline)
+    public string VoiceAdam { get; set; } = "pNInz6obpgDQGcFmaJgB";
+    public string VoiceJessica { get; set; } = "cgSgspJ2msm6clMCkdW9";
+    public string TtsModel { get; set; } = "eleven_multilingual_v2";
+    public string DefaultVoice { get; set; } = "adam";
+    public Dictionary<string, string> ExtraVoices { get; set; } = new Dictionary<string, string>(); // "naam": "voice_id"
+    public string VoiceSarah { get; set; } = "EXAVITQu4vr4xnSDxMaL";
+    public double Speed { get; set; } = 0.95;                          // Kokoro / Windows awaaz ki raftar
+    public string Engine { get; set; } = "auto";                       // auto | kokoro | eleven | windows
+    public int KokoroPort { get; set; } = 5005;
+    public bool CustToClientOnStart { get; set; } = false;     // false = shuru mein customer ki awaaz client ko nahi jati (F2 se ON karein)
+    public bool HearButtonVoice { get; set; } = false;         // false = button/auto-answer ki awaaz sirf Line 1 ko, aap ko repeat nahi sunai deti
+    public bool AutoAnswer { get; set; } = true;
+    public bool DefaultsAdded { get; set; } = false;
+    public List<PhraseCfg> Phrases { get; set; } = new List<PhraseCfg>();
+    public List<RuleCfg> Rules { get; set; } = new List<RuleCfg>();
+
+    public static string FilePath { get { return Path.Combine(AppContext.BaseDirectory, "config.json"); } }
+
+    public static AppConfig Load()
+    {
+        if (!File.Exists(FilePath)) return new AppConfig();
+        var c = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(FilePath)) ?? new AppConfig();
+        if (c.Phrases == null) c.Phrases = new List<PhraseCfg>();
+        if (c.Rules == null) c.Rules = new List<RuleCfg>();
+        if (c.ExtraVoices == null) c.ExtraVoices = new Dictionary<string, string>();
+        if (!c.DefaultsAdded)
+        {
+            c.DefaultsAdded = true;
+            if (c.Phrases.Count == 0)
+            {
+                c.Phrases.Add(new PhraseCfg { Label = "Greet", Text = "Greet them and ask how you can help." });
+                c.Phrases.Add(new PhraseCfg { Label = "Say again", Text = "Ask them to please repeat that." });
+                c.Phrases.Add(new PhraseCfg { Label = "Slowly", Text = "Speak slowly and clearly." });
+                c.Phrases.Add(new PhraseCfg { Label = "Yes", Text = "Say yes, absolutely." });
+                c.Phrases.Add(new PhraseCfg { Label = "Hold", Text = "Ask them to hold for one moment." });
+                c.Phrases.Add(new PhraseCfg { Label = "Confirm", Text = "Confirm the details with them." });
+                c.Phrases.Add(new PhraseCfg { Label = "Thank you", Text = "Say thank you for your time." });
+                c.Phrases.Add(new PhraseCfg { Label = "Goodbye", Text = "Say goodbye politely." });
+            }
+            if (c.Rules.Count == 0)
+            {
+                c.Rules.Add(new RuleCfg { Keywords = new[] { "date of birth", "birthday", "birth date", "born" }, Say = "They are asking your date of birth." });
+                c.Rules.Add(new RuleCfg { Keywords = new[] { "your name", "full name", "last name" }, Say = "They are asking your name." });
+                c.Rules.Add(new RuleCfg { Keywords = new[] { "address", "zip code", "postal" }, Say = "They are asking your address." });
+                c.Rules.Add(new RuleCfg { Keywords = new[] { "phone number", "contact number", "call you back" }, Say = "They are asking for a phone number." });
+                c.Rules.Add(new RuleCfg { Keywords = new[] { "email", "e mail" }, Say = "They are asking for an email address." });
+            }
+        }
+        foreach (var p in c.Phrases)
+        {
+            if (string.IsNullOrWhiteSpace(p.Cat))
+            {
+                var l = (p.Label ?? "").ToLowerInvariant();
+                p.Cat = (l == "greet" || l.StartsWith("hello")) ? "Greetings"
+                      : (l == "yes" || l == "no" || l == "confirm" || l == "hold") ? "Answers"
+                      : (l == "thank you" || l == "goodbye") ? "Closing" : "General";
+            }
+        }
+        if (c.Speed < 0.6 || c.Speed > 1.5) c.Speed = 0.95;
+        if (string.IsNullOrWhiteSpace(c.Engine)) c.Engine = "auto";
+        if (c.KokoroPort <= 0) c.KokoroPort = 5005;
+        if (string.IsNullOrWhiteSpace(c.VoiceSarah)) c.VoiceSarah = "EXAVITQu4vr4xnSDxMaL";
+        return c;
+    }
+
+    public void Save()
+    {
+        try { File.WriteAllText(FilePath, JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true })); }
+        catch { }
+    }
+}
+
+static class Program
+{
+    [STAThread]
+    static void Main()
+    {
+        ApplicationConfiguration.Initialize();
+        AppConfig cfg;
+        try
+        {
+            cfg = AppConfig.Load();
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("config.json ghalat hai:\n" + ex.Message);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(cfg.Server))
+        {
+            MessageBox.Show("config.json nahi mili ya usme Server khali hai.\nconfig.json exe ke saath rakhein.");
+            return;
+        }
+        Application.Run(new MainForm(cfg));
+    }
+}
+
+// ===== G711.cs =====
+public static class G711
+{
+    public static byte Encode(short s)
+    {
+        const int BIAS = 0x84, CLIP = 32635;
+        int pcm = s;
+        int sign = (pcm >> 8) & 0x80;
+        if (sign != 0) pcm = -pcm;
+        if (pcm > CLIP) pcm = CLIP;
+        pcm += BIAS;
+        int exp = 7;
+        for (int mask = 0x4000; (pcm & mask) == 0 && exp > 0; mask >>= 1) exp--;
+        int man = (pcm >> (exp + 3)) & 0x0F;
+        return (byte)~(sign | (exp << 4) | man);
+    }
+    public static short Decode(byte u)
+    {
+        u = (byte)~u;
+        int sign = u & 0x80, exp = (u >> 4) & 7, man = u & 0x0F;
+        int s = ((man << 3) + 0x84) << exp;
+        s -= 0x84;
+        return (short)(sign != 0 ? -s : s);
+    }
+}
+
+// ===== LineAudio.cs =====
+// Ek line ki awaaz: us line se aati awaaz (Incoming) aur us line ko bheji jane wali awaaz (SendFrame).
+public class LineAudio : IAudioSource, IAudioSink
+{
+    static readonly AudioFormat Pcmu = new AudioFormat(SDPWellKnownMediaFormatsEnum.PCMU);
+    public readonly ConcurrentQueue<short> Incoming = new ConcurrentQueue<short>();
+    public volatile bool Running;
+    int starts;   // kitne start/close ke jode chal rahe hain (purana session naye call ki awaaz band na kare)
+
+    public void ClearIncoming() { while (Incoming.TryDequeue(out _)) { } }
+    public void ResetRtpClock() { Interlocked.Exchange(ref lastRtpTicks, Environment.TickCount64); }
+    public double SecondsSinceRtp { get { long t = Interlocked.Read(ref lastRtpTicks); return t == 0 ? 0 : (Environment.TickCount64 - t) / 1000.0; } }
+    void Begin() { Interlocked.Increment(ref starts); Running = true; }
+    void End() { if (Interlocked.Decrement(ref starts) <= 0) { Interlocked.Exchange(ref starts, 0); Running = false; ClearIncoming(); } }
+
+    public event EncodedSampleDelegate OnAudioSourceEncodedSample;
+    public event RawAudioSampleDelegate OnAudioSourceRawSample { add { } remove { } }
+    public event SourceErrorDelegate OnAudioSourceError { add { } remove { } }
+    public event SourceErrorDelegate OnAudioSinkError { add { } remove { } }
+    // SIPSorcery 8.0.23+ ke liye zaroori (hum isse use nahi karte)
+    public event Action<EncodedAudioFrame> OnAudioSourceEncodedFrameReady { add { } remove { } }
+    long lastRtpTicks;
+
+    public void SendFrame(short[] pcm)
+    {
+        if (!Running) return;
+        var b = new byte[pcm.Length];
+        for (int i = 0; i < pcm.Length; i++) b[i] = G711.Encode(pcm[i]);
+        OnAudioSourceEncodedSample?.Invoke((uint)pcm.Length, b);
+    }
+
+    // ---- IAudioSource ----
+    public List<AudioFormat> GetAudioSourceFormats() => new List<AudioFormat> { Pcmu };
+    public void SetAudioSourceFormat(AudioFormat f) { }
+    public void RestrictFormats(Func<AudioFormat, bool> filter) { }
+    public Task StartAudio() { Begin(); return Task.CompletedTask; }
+    public Task PauseAudio() { return Task.CompletedTask; }
+    public Task ResumeAudio() { return Task.CompletedTask; }
+    public Task CloseAudio() { End(); return Task.CompletedTask; }
+    public bool IsAudioSourcePaused() => false;
+    public bool HasEncodedAudioSubscribers() => OnAudioSourceEncodedSample != null;
+    public void ExternalAudioSourceRawSample(AudioSamplingRatesEnum rate, uint durationMilliseconds, short[] sample) { }
+
+    // ---- IAudioSink ----
+    public List<AudioFormat> GetAudioSinkFormats() => new List<AudioFormat> { Pcmu };
+    public void SetAudioSinkFormat(AudioFormat f) { }
+    public Task StartAudioSink() { Begin(); return Task.CompletedTask; }
+    public Task PauseAudioSink() { return Task.CompletedTask; }
+    public Task ResumeAudioSink() { return Task.CompletedTask; }
+    public Task CloseAudioSink() { End(); return Task.CompletedTask; }
+    public void GotAudioRtp(IPEndPoint remoteEndPoint, uint ssrc, uint seqnum, uint timestamp, int payloadID, bool marker, byte[] payload)
+    {
+        if (payload == null) return;
+        Interlocked.Exchange(ref lastRtpTicks, Environment.TickCount64);
+        foreach (var b in payload) Incoming.Enqueue(G711.Decode(b));
+        while (Incoming.Count > 3200) Incoming.TryDequeue(out _);
+    }
+
+    // SIPSorcery 8.0.23+ ke liye zaroori. Agar RTP wala raasta (GotAudioRtp) chal raha ho to yeh ignore hota hai
+    // (double awaaz se bachne ke liye); warna PCMU frame se awaaz li jati hai.
+    public void GotEncodedMediaFrame(EncodedAudioFrame frame)
+    {
+        if (Environment.TickCount64 - Interlocked.Read(ref lastRtpTicks) < 1000) return;
+        try
+        {
+            var data = frame?.GetType().GetProperty("EncodedAudio")?.GetValue(frame) as byte[];
+            if (data == null) return;
+            foreach (var b in data) Incoming.Enqueue(G711.Decode(b));
+            while (Incoming.Count > 3200) Incoming.TryDequeue(out _);
+        }
+        catch { }
+    }
+}
+
+// ===== VoiceBank.cs =====
+// Text -> awaaz (8kHz). Ek baar banti hai, disk (voicecache folder) mein save hoti hai, aur app khulte hi RAM mein aa jati hai.
+// Engine: Kokoro (offline, exe ke saath kokoro.onnx + voices.bin + kokoro_server.py)  >  ElevenLabs (key ho to)  >  Windows voice.
+public class VoiceBank
+{
+    readonly AppConfig cfg;
+    readonly ConcurrentDictionary<string, short[]> ram = new ConcurrentDictionary<string, short[]>();
+    readonly string dir = Path.Combine(AppContext.BaseDirectory, "voicecache");
+    static readonly HttpClient http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+    static readonly HttpClient pingHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(1.5) };
+    readonly ManualResetEventSlim initDone = new ManualResetEventSlim(false);
+    System.Diagnostics.Process kproc;
+    volatile bool kokoroFailed;
+    public Action<string> Log;
+
+    public VoiceBank(AppConfig c)
+    {
+        cfg = c;
+        try { Directory.CreateDirectory(dir); } catch { }
+    }
+
+    string BaseDir { get { return AppContext.BaseDirectory; } }
+    string ServerPath { get { return Path.Combine(BaseDir, "kokoro_server.py"); } }
+    public bool KokoroFilesExist
+    {
+        get { return File.Exists(Path.Combine(BaseDir, "kokoro.onnx")) && File.Exists(Path.Combine(BaseDir, "voices.bin")) && File.Exists(ServerPath); }
+    }
+    bool WantKokoro
+    {
+        get { return !string.Equals(cfg.Engine, "eleven", StringComparison.OrdinalIgnoreCase) && !string.Equals(cfg.Engine, "windows", StringComparison.OrdinalIgnoreCase); }
+    }
+    public bool UsingEleven { get { return Engine == "eleven"; } }
+
+    public string Engine
+    {
+        get
+        {
+            if (WantKokoro && KokoroFilesExist && !kokoroFailed) return "kokoro";
+            if (!string.Equals(cfg.Engine, "windows", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(cfg.ElevenLabsKey)) return "eleven";
+            return "sapi";
+        }
+    }
+    public string EngineLabel { get { var e = Engine; return e == "kokoro" ? "Kokoro (offline)" : e == "eleven" ? "ElevenLabs" : "Windows voice"; } }
+    public string Kind { get { var e = Engine; return e == "kokoro" ? "Built-in voice" : e == "eleven" ? "ElevenLabs voice" : "Windows voice"; } }
+
+    public List<string> VoiceNames()
+    {
+        var l = new List<string> { "adam", "jessica", "sarah" };
+        if (cfg.ExtraVoices != null) foreach (var k in cfg.ExtraVoices.Keys) { var n = k.Trim().ToLowerInvariant(); if (n.Length > 0 && !l.Contains(n)) l.Add(n); }
+        return l;
+    }
+
+    public bool IsVoiceName(string n) { return VoiceNames().Contains((n ?? "").Trim().ToLowerInvariant()); }
+
+    string KokoroId(string voice)
+    {
+        var v = (voice ?? "adam").Trim().ToLowerInvariant();
+        if (v == "adam") return "am_adam";
+        if (v == "jessica") return "af_jessica";
+        if (v == "sarah") return "af_sarah";
+        if (cfg.ExtraVoices != null)
+            foreach (var kv in cfg.ExtraVoices)
+                if (kv.Key.Trim().ToLowerInvariant() == v && kv.Value != null && kv.Value.Contains("_") && kv.Value.Length <= 16) return kv.Value.Trim();
+        return "am_adam";
+    }
+
+    public string Gender(string voice)
+    {
+        var v = (voice ?? "").Trim().ToLowerInvariant();
+        if (v == "adam") return "male";
+        if (v == "jessica" || v == "sarah") return "female";
+        var id = KokoroId(v);
+        return id.Length > 1 && id[1] == 'm' ? "male" : "female";
+    }
+
+    string VoiceId(string voice)   // ElevenLabs
+    {
+        var v = (voice ?? "adam").Trim().ToLowerInvariant();
+        if (v == "adam") return cfg.VoiceAdam;
+        if (v == "jessica") return cfg.VoiceJessica;
+        if (v == "sarah") return cfg.VoiceSarah;
+        if (cfg.ExtraVoices != null)
+            foreach (var kv in cfg.ExtraVoices) if (kv.Key.Trim().ToLowerInvariant() == v) return kv.Value;
+        return voice;
+    }
+
+    string Key(string voice, string text, string engine)
+    {
+        string e = engine == "kokoro" ? "kk:" + KokoroId(voice) + ":" + cfg.Speed.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)
+                 : engine == "eleven" ? "el:" + cfg.TtsModel + ":" + VoiceId(voice)
+                 : "sapi:" + cfg.Speed.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture);
+        var raw = (voice ?? "").Trim().ToLowerInvariant() + "|" + e + "|" + (text ?? "").Trim();
+        using (var sha = SHA1.Create())
+            return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(raw))).Replace("-", "").ToLowerInvariant();
+    }
+
+    // Sirf RAM / disk se (network kabhi nahi): foran milta hai ya null.
+    public short[] TryGetCached(string voice, string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var k = Key(voice, text, Engine);
+        if (ram.TryGetValue(k, out var s)) return s;
+        var f = Path.Combine(dir, k + ".pcm");
+        try
+        {
+            if (File.Exists(f))
+            {
+                var b = File.ReadAllBytes(f);
+                var p = new short[b.Length / 2];
+                Buffer.BlockCopy(b, 0, p, 0, p.Length * 2);
+                if (p.Length > 0) { ram[k] = p; return p; }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Cache mein na ho to bana kar deta hai. Background thread se bulayein.
+    public short[] Get(string voice, string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        if (WantKokoro && KokoroFilesExist && !initDone.IsSet) initDone.Wait(90000);   // Kokoro abhi start ho raha ho to intezar
+        var c = TryGetCached(voice, text);
+        if (c != null) return c;
+        var eng = Engine;
+        short[] p = null;
+        try { p = eng == "kokoro" ? Kokoro(voice, text.Trim()) : eng == "eleven" ? Eleven(voice, text.Trim()) : Sapi(voice, text.Trim()); }
+        catch (Exception ex) { Log?.Invoke("TTS ERROR (" + eng + "): " + ex.Message); }
+        if (p == null || p.Length == 0) return null;
+        p = TrimStart(p);
+        var k = Key(voice, text, eng);
+        ram[k] = p;
+        try
+        {
+            var b = new byte[p.Length * 2];
+            Buffer.BlockCopy(p, 0, b, 0, b.Length);
+            File.WriteAllBytes(Path.Combine(dir, k + ".pcm"), b);
+        }
+        catch { }
+        return p;
+    }
+
+    // Shuru ki khamoshi kaat do taake button dabate hi awaaz shuru ho
+    static short[] TrimStart(short[] p)
+    {
+        int i = 0;
+        while (i < p.Length && Math.Abs((int)p[i]) < 400) i++;
+        i = Math.Max(0, i - 80);
+        if (i <= 0) return p;
+        var o = new short[p.Length - i];
+        Array.Copy(p, i, o, 0, o.Length);
+        return o;
+    }
+
+    // ---- Kokoro (offline) ----
+    bool Ping()
+    {
+        try { using (var r = pingHttp.GetAsync("http://127.0.0.1:" + cfg.KokoroPort + "/ping").GetAwaiter().GetResult()) return r.IsSuccessStatusCode; }
+        catch { return false; }
+    }
+
+    System.Diagnostics.Process Launch(string exe)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = (exe == "py" ? "-3 " : "") + "\"" + ServerPath + "\" " + cfg.KokoroPort,
+                WorkingDirectory = BaseDir,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return null;
+            p.OutputDataReceived += (s, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) Log?.Invoke("[kokoro] " + e.Data); };
+            p.ErrorDataReceived += (s, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) Log?.Invoke("[kokoro] " + e.Data); };
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+            return p;
+        }
+        catch { return null; }
+    }
+
+    // App khulte hi bulayein (background). Kokoro server khud start karta hai.
+    public Task InitAsync()
+    {
+        return Task.Run(() =>
+        {
+            try
+            {
+                if (!WantKokoro) return;
+                if (!KokoroFilesExist) { Log?.Invoke("Kokoro files (kokoro.onnx, voices.bin, kokoro_server.py) exe ke saath nahi - dusri awaaz chalegi"); return; }
+                if (Ping()) { Log?.Invoke("Kokoro server pehle se chal raha hai"); return; }
+                foreach (var exe in new[] { "python", "py" })
+                {
+                    var p = Launch(exe);
+                    if (p == null) continue;
+                    kproc = p;
+                    for (int i = 0; i < 160; i++)
+                    {
+                        Thread.Sleep(500);
+                        if (p.HasExited) break;
+                        if (Ping()) { Log?.Invoke("Kokoro awaaz tayyar (offline)"); return; }
+                    }
+                    try { if (!p.HasExited) p.Kill(true); } catch { }
+                }
+                kokoroFailed = true;
+                Log?.Invoke("Kokoro start nahi hua. Python install karke install_kokoro.bat chalayein. Abhi dusri awaaz chalegi.");
+            }
+            catch (Exception ex) { kokoroFailed = true; Log?.Invoke("Kokoro error: " + ex.Message); }
+            finally { initDone.Set(); }
+        });
+    }
+
+    public void Shutdown()
+    {
+        try { if (kproc != null && !kproc.HasExited) kproc.Kill(true); } catch { }
+    }
+
+    short[] Kokoro(string voice, string text)
+    {
+        var body = JsonSerializer.Serialize(new { text = text, voice = KokoroId(voice), speed = cfg.Speed });
+        using (var req = new HttpRequestMessage(HttpMethod.Post, "http://127.0.0.1:" + cfg.KokoroPort + "/tts"))
+        {
+            req.Content = new StringContent(body, Encoding.UTF8, "application/json");
+            using (var resp = http.Send(req))
+            {
+                var data = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception("Kokoro " + (int)resp.StatusCode + ": " + Encoding.UTF8.GetString(data, 0, Math.Min(data.Length, 200)));
+                var pcm = new short[data.Length / 2];
+                Buffer.BlockCopy(data, 0, pcm, 0, pcm.Length * 2);
+                return pcm;
+            }
+        }
+    }
+
+    short[] Eleven(string voice, string text)
+    {
+        var url = "https://api.elevenlabs.io/v1/text-to-speech/" + VoiceId(voice) + "?output_format=ulaw_8000";
+        var body = JsonSerializer.Serialize(new { text = text, model_id = cfg.TtsModel });
+        using (var req = new HttpRequestMessage(HttpMethod.Post, url))
+        {
+            req.Headers.Add("xi-api-key", cfg.ElevenLabsKey.Trim());
+            req.Content = new StringContent(body, Encoding.UTF8, "application/json");
+            using (var resp = http.Send(req))
+            {
+                var data = resp.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception("ElevenLabs " + (int)resp.StatusCode + ": " + Encoding.UTF8.GetString(data, 0, Math.Min(data.Length, 200)));
+                var pcm = new short[data.Length];
+                for (int i = 0; i < data.Length; i++) pcm[i] = G711.Decode(data[i]);   // ulaw_8000 = seedha telephone format
+                return pcm;
+            }
+        }
+    }
+
+    short[] Sapi(string voice, string text)
+    {
+        using (var synth = new System.Speech.Synthesis.SpeechSynthesizer())
+        using (var ms = new MemoryStream())
+        {
+            try { synth.SelectVoiceByHints(Gender(voice) == "female" ? System.Speech.Synthesis.VoiceGender.Female : System.Speech.Synthesis.VoiceGender.Male); } catch { }
+            try { synth.Rate = Math.Max(-10, Math.Min(10, (int)Math.Round((cfg.Speed - 1.0) * 10))); } catch { }
+            synth.SetOutputToAudioStream(ms, new System.Speech.AudioFormat.SpeechAudioFormatInfo(8000, System.Speech.AudioFormat.AudioBitsPerSample.Sixteen, System.Speech.AudioFormat.AudioChannel.Mono));
+            synth.Speak(text);
+            synth.SetOutputToNull();
+            var b = ms.ToArray();
+            var p = new short[b.Length / 2];
+            Buffer.BlockCopy(b, 0, p, 0, p.Length * 2);
+            return p;
+        }
+    }
+}
+
+// ===== AudioMixer.cs =====
+// Line 1 = CLIENT, Line 2 = CUSTOMER.
+// SAFETY: Aapka mic aur Phrase/TTS awaaz SIRF Line 1 (client) ko jati hai.
+// Line 2 (customer) ko jane wale audio ke raaste mein mic ya phrase ka koi code hai hi nahi:
+//   Line 2 ko sirf (a) client ki awaaz ya (b) khamoshi jati hai.
+public class AudioMixer : IDisposable
+{
+    const int Frame = 160; // 20ms @ 8kHz
+    public readonly LineAudio Line1 = new LineAudio(); // client
+    public readonly LineAudio Line2 = new LineAudio(); // customer
+    public volatile bool MicMuted;
+    public volatile bool CaptionOn;
+    // Do alag switch (sirf aap dabayen to badalte hain, app khud kabhi nahi badalti):
+    //   CustToClient: ON = customer ki awaaz client ko jati hai. OFF = client customer ko nahi sun sakta (aap phir bhi sunte hain).
+    //   ClientToCust: ON = client ki awaaz customer ko jati hai. OFF = customer ko khamoshi.
+    public volatile bool CustToClient = true;
+    public volatile bool ClientToCust = true;
+    public volatile bool MonitorPhrase = true;   // phrase aap ko bhi sunai de
+    short[] phr; int phrPos; readonly object phrLock = new object();
+    public volatile int Level1Out, Level2Out;    // meter: Line 1 / Line 2 ko asal mein jane wali awaaz
+    public readonly BlockingCollection<short[]> CaptionQueue = new BlockingCollection<short[]>(200);
+
+    WaveInEvent mic;
+    WaveOutEvent spk;
+    BufferedWaveProvider spkBuf;
+    readonly ConcurrentQueue<short> micQ = new ConcurrentQueue<short>();
+    Thread pump; volatile bool pumpRun;
+    long lastErrLog;
+    public Action<string> Log;
+
+    [System.Runtime.InteropServices.DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
+    [System.Runtime.InteropServices.DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
+
+    // RTP ka dil: har 20ms par dono lines ko frame jata hai - mic chale ya ruk jaye (VB-Cable), call zinda rehti hai.
+    void EnsurePump()
+    {
+        if (pumpRun) return;
+        pumpRun = true;
+        pump = new Thread(PumpLoop) { IsBackground = true, Priority = ThreadPriority.AboveNormal, Name = "RtpPump" };
+        pump.Start();
+    }
+
+    void PumpLoop()
+    {
+        try { timeBeginPeriod(1); } catch { }
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        long next = 20;
+        while (pumpRun)
+        {
+            long now = sw.ElapsedMilliseconds;
+            if (now < next) { Thread.Sleep(1); continue; }
+            if (now - next > 100) next = now;   // bohot peeche reh gaye to burst nahi, seedha aage
+            next += 20;
+            try
+            {
+                var m = new short[Frame];
+                if (micQ.Count >= Frame)
+                    for (int i = 0; i < Frame; i++) { micQ.TryDequeue(out var v); m[i] = v; }
+                Process(MicMuted ? new short[Frame] : m);
+            }
+            catch (Exception ex)
+            {
+                if (Environment.TickCount64 - lastErrLog > 5000) { lastErrLog = Environment.TickCount64; Log?.Invoke("AUDIO PUMP error: " + ex.Message); }
+            }
+        }
+        try { timeEndPeriod(1); } catch { }
+    }
+
+    // micDevice / spkDevice: -1 = Windows default, 0.. = us number ki device
+    public void Start(int micDevice, int spkDevice)
+    {
+        EnsurePump();   // device fail bhi ho jaye to RTP chalta rahe
+        Stop();
+        var fmt = new WaveFormat(8000, 16, 1);
+        Exception err = null;
+        try
+        {
+            spkBuf = new BufferedWaveProvider(fmt) { DiscardOnBufferOverflow = true, BufferDuration = TimeSpan.FromSeconds(1) };
+            spk = new WaveOutEvent { DeviceNumber = spkDevice };
+            spk.Init(spkBuf);
+            spk.Play();
+        }
+        catch (Exception ex) { err = ex; spkBuf = null; }
+        while (micQ.TryDequeue(out _)) { }
+        try
+        {
+            mic = new WaveInEvent { DeviceNumber = micDevice, WaveFormat = fmt, BufferMilliseconds = 20 };
+            mic.DataAvailable += OnMic;
+            mic.StartRecording();
+        }
+        catch (Exception ex) { if (err == null) err = ex; }
+        if (err != null) throw err;
+    }
+
+    void Stop()
+    {
+        try { if (mic != null) { mic.DataAvailable -= OnMic; mic.StopRecording(); mic.Dispose(); } } catch { }
+        try { if (spk != null) { spk.Stop(); spk.Dispose(); } } catch { }
+        mic = null; spk = null;
+    }
+
+    static int Rms(short[] f)
+    {
+        double s = 0;
+        foreach (var v in f) s += (double)v * v;
+        return (int)Math.Sqrt(s / f.Length);
+    }
+
+    static short[] Pull(LineAudio l)
+    {
+        var f = new short[Frame];
+        for (int i = 0; i < Frame; i++) { if (l.Incoming.TryDequeue(out var s)) f[i] = s; else break; }
+        return f;
+    }
+
+    static short[] Mix(short[] a, short[] b)
+    {
+        var o = new short[Frame];
+        for (int i = 0; i < Frame; i++)
+        {
+            int v = a[i] + (b == null ? 0 : b[i]);
+            o[i] = (short)Math.Clamp(v, short.MinValue, short.MaxValue);
+        }
+        return o;
+    }
+
+    static short[] MixN(params short[][] a)
+    {
+        var o = new short[Frame];
+        for (int i = 0; i < Frame; i++)
+        {
+            int v = 0;
+            for (int k = 0; k < a.Length; k++) if (a[k] != null) v += a[k][i];
+            o[i] = (short)Math.Clamp(v, short.MinValue, short.MaxValue);
+        }
+        return o;
+    }
+
+    // Phrase / TTS awaaz: SIRF Line 1 ko. Naya press purane ko foran kaat deta hai.
+    public void PlayToLine1(short[] pcm) { if (pcm == null || pcm.Length == 0) return; lock (phrLock) { phr = pcm; phrPos = 0; } }
+    public void StopPhrase() { lock (phrLock) { phr = null; phrPos = 0; } }
+
+    // Voice test (Play): SIRF aap ke speaker par. Line 1 / Line 2 ko kabhi nahi jati.
+    short[] prev; int prevPos; readonly object prevLock = new object();
+    public void PreviewToMe(short[] pcm) { if (pcm == null || pcm.Length == 0) return; lock (prevLock) { prev = pcm; prevPos = 0; } }
+    short[] NextPreviewFrame()
+    {
+        lock (prevLock)
+        {
+            if (prev == null) return null;
+            var f = new short[Frame];
+            int n = Math.Min(Frame, prev.Length - prevPos);
+            if (n > 0) Array.Copy(prev, prevPos, f, 0, n);
+            prevPos += Math.Max(n, 0);
+            if (prevPos >= prev.Length) { prev = null; prevPos = 0; }
+            return f;
+        }
+    }
+
+    short[] NextPhraseFrame()
+    {
+        lock (phrLock)
+        {
+            if (phr == null) return null;
+            var f = new short[Frame];
+            int n = Math.Min(Frame, phr.Length - phrPos);
+            if (n > 0) Array.Copy(phr, phrPos, f, 0, n);
+            phrPos += Math.Max(n, 0);
+            if (phrPos >= phr.Length) { phr = null; phrPos = 0; }
+            return f;
+        }
+    }
+
+    // Mic sirf queue mein jata hai; bheji jane ka kaam pump karta hai.
+    void OnMic(object s, WaveInEventArgs e)
+    {
+        for (int i = 0; i + 1 < e.BytesRecorded; i += 2) micQ.Enqueue(BitConverter.ToInt16(e.Buffer, i));
+        while (micQ.Count > 1600) micQ.TryDequeue(out _);   // 200ms se zyada jama na ho
+    }
+
+    void Process(short[] mic)
+    {
+        var l1 = Pull(Line1); // client ki awaaz
+        var l2 = Pull(Line2); // customer ki awaaz
+        var ph = NextPhraseFrame();
+        var pv = NextPreviewFrame();   // voice test (sirf mujhe)   // phrase/TTS (null = kuch nahi chal raha)
+
+        // Line 1 ko: meri awaaz + phrase + (agar ON) customer ki awaaz
+        var out1 = MixN(mic, CustToClient ? l2 : null, ph);
+        // Line 2 ko: SIRF client ki awaaz (agar ON), warna khamoshi
+        var out2 = ClientToCust ? l1 : new short[Frame];
+
+        Line1.SendFrame(out1);
+        Line2.SendFrame(out2);          // <-- yahan mic / phrase kabhi nahi aata
+        Level1Out = Rms(out1); Level2Out = Rms(out2);
+
+        var heard = MixN(l1, l2, MonitorPhrase ? ph : null, pv);   // Mujhe: dono (pause mein bhi)
+        var bytes = new byte[Frame * 2];
+        Buffer.BlockCopy(heard, 0, bytes, 0, bytes.Length);
+        spkBuf?.AddSamples(bytes, 0, bytes.Length);
+
+        if (CaptionOn) CaptionQueue.TryAdd(l2); // caption / keyword sirf customer ki awaaz ka
+    }
+
+    public void Dispose() { pumpRun = false; Stop(); }
+}
+
+// ===== Captioner.cs =====
+// Line 2 (customer) ki awaaz ko text mein badalta hai (offline, Vosk).
+public class Captioner : IDisposable
+{
+    public event Action<string, bool> OnText; // (text, final?)
+    Model model; VoskRecognizer rec; Thread worker; volatile bool run;
+
+    public static bool ModelExists() => Directory.Exists(Path.Combine(AppContext.BaseDirectory, "model"));
+
+    public void Start(BlockingCollection<short[]> q)
+    {
+        if (run) return;
+        Vosk.Vosk.SetLogLevel(-1);
+        model = new Model(Path.Combine(AppContext.BaseDirectory, "model"));
+        rec = new VoskRecognizer(model, 16000.0f);
+        run = true;
+        worker = new Thread(() =>
+        {
+            while (run)
+            {
+                if (!q.TryTake(out var f, 200)) continue;
+                // 8kHz -> 16kHz (simple interpolation)
+                var up = new short[f.Length * 2];
+                for (int i = 0; i < f.Length; i++)
+                {
+                    short a = f[i], b = i + 1 < f.Length ? f[i + 1] : f[i];
+                    up[i * 2] = a; up[i * 2 + 1] = (short)((a + b) / 2);
+                }
+                try
+                {
+                    if (rec.AcceptWaveform(up, up.Length))
+                    {
+                        var t = JsonDocument.Parse(rec.Result()).RootElement.GetProperty("text").GetString();
+                        if (!string.IsNullOrWhiteSpace(t)) OnText?.Invoke(t, true);
+                    }
+                    else
+                    {
+                        var t = JsonDocument.Parse(rec.PartialResult()).RootElement.GetProperty("partial").GetString();
+                        if (!string.IsNullOrWhiteSpace(t)) OnText?.Invoke(t, false);
+                    }
+                }
+                catch { }
+            }
+        }) { IsBackground = true };
+        worker.Start();
+    }
+
+    public void Dispose() { run = false; try { rec?.Dispose(); model?.Dispose(); } catch { } }
+}
+
+// ===== SipLine.cs =====
+public class SipLine
+{
+    readonly SIPTransport transport;
+    readonly AppConfig cfg;
+    readonly string name;
+    public readonly LineAudio Audio;
+    public readonly SIPUserAgent UA;
+    public event Action<string> StateChanged;
+    public Action<string> Log;
+    public Func<bool> CanAnswer = () => true;
+    string last = "";
+    volatile bool localHangup;   // aap ne khud Hangup/Cancel dabaya
+    volatile bool dialing;       // INVITE ja chuka, jawab abhi nahi aaya (ringing)
+    public bool Busy => UA.IsCallActive || dialing;
+
+    public SipLine(string name, SIPTransport t, AppConfig c, LineAudio audio)
+    {
+        this.name = name; transport = t; cfg = c; Audio = audio;
+        UA = new SIPUserAgent(transport, null);
+        UA.ClientCallTrying += (uac, resp) => { if (!localHangup) Set("Trying..."); };
+        UA.ClientCallRinging += (uac, resp) => { if (!localHangup) Set("Ringing..."); };
+        UA.ClientCallAnswered += (uac, resp) =>
+        {
+            if (localHangup) { Log?.Invoke(name + ": cancel ke baad answer aaya - foran kat raha hoon"); Task.Run(TearDown); return; }
+            Set("CONNECTED");
+        };
+        UA.ClientCallFailed += (uac, err, resp) =>
+        {
+            if (localHangup) Set("Cancelled");
+            else Set("Failed: " + err + (resp != null ? " [" + resp.StatusCode + "]" : ""));
+        };
+        UA.OnCallHungup += d =>
+        {
+            Audio.ClearIncoming();
+            if (localHangup) Log?.Invoke(name + ": call band (aap ne kati)");
+            else Set("Hung up (doosri taraf/server ne call kati)");
+        };
+        UA.OnIncomingCall += async (ua, req) =>
+        {
+            if (ua.IsCallActive || dialing || !CanAnswer()) return;
+            localHangup = false;
+            Set("Incoming call...");
+            var uas = ua.AcceptCall(req);
+            var ok = await ua.Answer(uas, NewSession());
+            Set(ok ? "CONNECTED" : "Answer failed");
+        };
+    }
+
+    void Set(string s)
+    {
+        last = s;
+        Log?.Invoke(name + ": " + s);
+        StateChanged?.Invoke(s);
+    }
+
+    VoIPMediaSession NewSession()
+    {
+        var s = new VoIPMediaSession(new MediaEndPoints { AudioSource = Audio, AudioSink = Audio });
+        s.AcceptRtpFromAny = true;
+        return s;
+    }
+
+    // fullNumber = prefix + number (MainForm bana kar deta hai)
+    public async Task Dial(string fullNumber)
+    {
+        if (Busy) { Log?.Invoke(name + ": pehle se call par hai"); return; }
+        localHangup = false;
+        Audio.ClearIncoming();
+        Audio.ResetRtpClock();
+        string dst = "sip:" + fullNumber + "@" + cfg.Server;
+        Set("Dialing " + fullNumber);
+        Log?.Invoke(name + ": DIAL " + dst + "  (account " + cfg.User + ")");
+        dialing = true;
+        try
+        {
+            bool ok = await UA.Call(dst, cfg.User, cfg.Password, NewSession());
+            if (localHangup)
+            {
+                if (ok) { try { UA.Hangup(); } catch { } }
+            }
+            else if (!ok && !last.StartsWith("Failed")) Set("Call failed");
+        }
+        catch (Exception ex) { if (!localHangup) Set("Error: " + ex.Message); }
+        finally { dialing = false; }
+    }
+
+    void TryCancel()
+    {
+        // Ringing wali call ko CANCEL bhejna (method ka naam reflection se, taake version se farq na pade)
+        try { UA.GetType().GetMethod("Cancel", Type.EmptyTypes)?.Invoke(UA, null); } catch { }
+    }
+
+    // Foran: screen par state usi lamhe badal jati hai, network ka kaam peeche background mein hota hai.
+    public void Hangup()
+    {
+        if (!Busy) { Log?.Invoke(name + ": koi call nahi hai"); return; }
+        bool ringing = dialing && !UA.IsCallActive;
+        localHangup = true;
+        Audio.ClearIncoming();
+        Set(ringing ? "Cancelled" : "Hung up");
+        Task.Run(TearDown);
+    }
+
+    // BYE / CANCEL tab tak dohrata hai jab tak call waqai khatam na ho jaye.
+    void TearDown()
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            try { UA.Hangup(); } catch (Exception ex) { Log?.Invoke(name + ": hangup error: " + ex.Message); }
+            TryCancel();
+            Thread.Sleep(400);
+            if (!dialing && !UA.IsCallActive) break;
+        }
+    }
+
+    // App band hote waqt (form close): wahin ke wahin kaat do
+    public void HangupSync()
+    {
+        localHangup = true;
+        try { UA.Hangup(); } catch { }
+        TryCancel();
+    }
+}
+
+// ===== MainForm.cs =====
+// Phrase button / voice chip (dark card). Button DABATE hi (MouseDown) chalta hai - click chhodne ka intezar nahi.
+public class PadCard : Control
+{
+    public string Title = "", Sub = "", Badge = "", AvatarLetter = "";
+    public bool Selected, Ready = true, Avatar;
+    public Color AvatarColor = Color.FromArgb(46, 80, 120);
+    public int PlayZone;
+    public event Action Pressed;
+    public event Action PlayPressed;
+    bool hover;
+    static readonly Font FB = new Font("Segoe UI", 9.5f, FontStyle.Bold);
+    static readonly Font FS = new Font("Segoe UI", 8f);
+    static readonly Font FA = new Font("Segoe UI", 10f, FontStyle.Bold);
+
+    public PadCard()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Cursor = Cursors.Hand;
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (e.Button != MouseButtons.Left) return;
+        if (PlayZone > 0 && e.X > Width - PlayZone) PlayPressed?.Invoke(); else Pressed?.Invoke();
+    }
+
+    static System.Drawing.Drawing2D.GraphicsPath Round(Rectangle r, int d)
+    {
+        var p = new System.Drawing.Drawing2D.GraphicsPath();
+        p.AddArc(r.X, r.Y, d, d, 180, 90);
+        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure();
+        return p;
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        g.Clear(Parent != null ? Parent.BackColor : Color.Black);
+        if (Width < 20 || Height < 20) return;
+        var r = new Rectangle(0, 0, Width - 1, Height - 1);
+        Color top, bot, bord;
+        if (Avatar)
+        {
+            top = Selected ? Color.FromArgb(24, 56, 58) : Color.FromArgb(24, 34, 52);
+            bot = Selected ? Color.FromArgb(18, 42, 46) : Color.FromArgb(17, 25, 40);
+            bord = Selected ? Color.FromArgb(52, 211, 153) : Color.FromArgb(40, 54, 80);
+        }
+        else if (Ready)
+        {
+            top = hover ? Color.FromArgb(48, 124, 96) : Color.FromArgb(37, 102, 80);
+            bot = Color.FromArgb(22, 62, 50);
+            bord = Color.FromArgb(52, 150, 110);
+        }
+        else
+        {
+            top = Color.FromArgb(46, 54, 70); bot = Color.FromArgb(32, 40, 54); bord = Color.FromArgb(62, 74, 94);
+        }
+        using (var path = Round(r, 10))
+        {
+            using (var br = new System.Drawing.Drawing2D.LinearGradientBrush(r, top, bot, 90f)) g.FillPath(br, path);
+            if (!Avatar && Ready)
+            {
+                g.SetClip(path);
+                using (var b2 = new SolidBrush(Color.FromArgb(52, 211, 153))) g.FillRectangle(b2, 0, Height - 5, Width, 5);
+                g.ResetClip();
+            }
+            using (var pen = new Pen(bord, Selected ? 2f : 1f)) g.DrawPath(pen, path);
+        }
+        var fg = Ready || Avatar ? Color.FromArgb(235, 242, 248) : Color.FromArgb(140, 152, 172);
+        var dim = Color.FromArgb(150, 175, 190);
+        var fl = TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine;
+        if (Avatar)
+        {
+            var ar = new Rectangle(8, (Height - 28) / 2, 28, 28);
+            using (var ab = new SolidBrush(AvatarColor)) g.FillEllipse(ab, ar);
+            TextRenderer.DrawText(g, AvatarLetter, FA, ar, Color.White, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            int tw = Width - 46 - Math.Max(PlayZone, 8);
+            TextRenderer.DrawText(g, Title, FB, new Rectangle(44, 4, tw, Height / 2 - 2), fg, fl);
+            TextRenderer.DrawText(g, Sub, FS, new Rectangle(44, Height / 2, tw, Height / 2 - 4), dim, fl);
+            if (PlayZone > 0)
+            {
+                var pr = new Rectangle(Width - PlayZone + 4, (Height - 24) / 2, 24, 24);
+                using (var pb = new SolidBrush(Color.FromArgb(40, 56, 84))) g.FillEllipse(pb, pr);
+                var tri = new Point[] { new Point(pr.X + 9, pr.Y + 7), new Point(pr.X + 9, pr.Y + 17), new Point(pr.X + 18, pr.Y + 12) };
+                using (var tb = new SolidBrush(Color.FromArgb(220, 230, 240))) g.FillPolygon(tb, tri);
+            }
+        }
+        else
+        {
+            TextRenderer.DrawText(g, Title, FB, new Rectangle(8, 4, Width - 38, 22), fg, fl);
+            if (Badge.Length > 0) TextRenderer.DrawText(g, Badge, FS, new Rectangle(Width - 32, 4, 26, 18), dim, TextFormatFlags.Right | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+            TextRenderer.DrawText(g, Sub, FS, new Rectangle(8, 28, Width - 14, 18), dim, fl);
+        }
+    }
+}
+
+public class MainForm : Form
+{
+    static readonly Color BgC = Color.FromArgb(11, 17, 28);
+    static readonly Color Pn = Color.FromArgb(17, 26, 43);
+    static readonly Color Pn2 = Color.FromArgb(28, 40, 64);
+    static readonly Color Bd = Color.FromArgb(46, 62, 92);
+    static readonly Color Fg = Color.FromArgb(230, 237, 243);
+    static readonly Color Dim = Color.FromArgb(139, 154, 178);
+    static readonly Color[] AvColors = { Color.FromArgb(46, 80, 120), Color.FromArgb(122, 48, 86), Color.FromArgb(40, 120, 90), Color.FromArgb(130, 100, 40), Color.FromArgb(94, 62, 134) };
+
+    readonly AppConfig cfg;
+    readonly AudioMixer mixer = new AudioMixer();
+    readonly Captioner captioner = new Captioner();
+    SIPTransport transport;
+    SIPRegistrationUserAgent reg;
+    SipLine line1, line2;
+    int sel = 1;
+    bool loading = true;
+    Color accent = Color.FromArgb(31, 111, 235);
+    Label lblReg, lblS1, lblS2, lblPartial, lblPreview, lblLast, lblSpeed, lblCache, lblRules;
+    TextBox txtNum, txtCaption, txtLog;
+    ComboBox cmbUser, cmbPrefix, cmbMic, cmbSpk, cmbCat;
+    CheckBox chkAuto;
+    Button btnHear, btnL1, btnL2, btnCall, btnHang, btnMute, btnCaption, btnC2C1, btnC1C2, btnAuto, btnStop, btnLog;
+    TextBox txtQuick, txtKw, txtAns;
+    FlowLayoutPanel pnlPhr, pnlTabs, pnlVoices;
+    ListBox lstRules;
+    TrackBar tbSpeed;
+    Form logForm;
+    string curCat = "All";
+    string curVoice = "adam";
+    readonly ToolTip tip = new ToolTip();
+    readonly VoiceBank bank;
+    bool autoAnswer;
+    readonly HashSet<RuleCfg> firedUtt = new HashSet<RuleCfg>();
+    readonly Dictionary<RuleCfg, long> ruleLast = new Dictionary<RuleCfg, long>();
+    ProgressBar pb1, pb2;
+    string state1 = "Idle", state2 = "Idle";
+    string lastPartial = "";
+    bool rtpWarn1, rtpWarn2;
+
+    public MainForm(AppConfig c)
+    {
+        cfg = c;
+        bank = new VoiceBank(cfg);
+        autoAnswer = cfg.AutoAnswer;
+        curVoice = (cfg.DefaultVoice ?? "adam").Trim().ToLowerInvariant();
+        if (!bank.IsVoiceName(curVoice)) curVoice = "adam";
+        try { accent = ColorTranslator.FromHtml(cfg.AccentColor); } catch { }
+        Text = cfg.AppName;
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = false;
+        ClientSize = new Size(1140, 664);
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = BgC;
+        ForeColor = Fg;
+        KeyPreview = true;
+        mixer.MonitorPhrase = cfg.HearButtonVoice;      // button ki awaaz mujhe sunai de ya nahi (call mein repeat se bachne ke liye)
+        mixer.CustToClient = cfg.CustToClientOnStart;   // shuru mein customer ki awaaz Line 1 ko NAHI jati (jab tak aap F2 se ON na karein)
+        BuildUi();
+        Load += async (s, e) => await StartAsync();
+        KeyDown += (s, e) => OnHotkey(e);
+        FormClosing += (s, e) =>
+        {
+            try { cfg.Prefix = cmbPrefix.Text.Trim(); cfg.UsePrefix = chkAuto.Checked; cfg.User = cmbUser.Text.Trim(); cfg.AutoAnswer = autoAnswer; cfg.DefaultVoice = curVoice; cfg.HearButtonVoice = mixer.MonitorPhrase; cfg.Save(); } catch { }
+            try { line1?.HangupSync(); line2?.HangupSync(); Thread.Sleep(300); reg?.Stop(); transport?.Shutdown(); captioner.Dispose(); mixer.Dispose(); } catch { }
+            try { bank.Shutdown(); } catch { }
+        };
+    }
+
+    Button Btn(string text, int x, int y, int w, int h, Color? back = null, Color? fore = null)
+    {
+        var b = new Button { Text = text, Left = x, Top = y, Width = w, Height = h, FlatStyle = FlatStyle.Flat, BackColor = back ?? Pn2, ForeColor = fore ?? Fg, Font = new Font("Segoe UI", 9, FontStyle.Bold), UseVisualStyleBackColor = false };
+        b.FlatAppearance.BorderColor = Bd;
+        b.FlatAppearance.MouseOverBackColor = Color.FromArgb(Math.Min(255, b.BackColor.R + 22), Math.Min(255, b.BackColor.G + 22), Math.Min(255, b.BackColor.B + 22));
+        return b;
+    }
+
+    Label Lbl(string text, int x, int y, int w, int h = 20, Font font = null, Color? fore = null)
+    {
+        return new Label { Text = text, Left = x, Top = y, Width = w, Height = h, AutoSize = false, Font = font ?? new Font("Segoe UI", 9), ForeColor = fore ?? Fg, BackColor = Color.Transparent };
+    }
+
+    void Dark(Control c)
+    {
+        c.BackColor = Pn2; c.ForeColor = Fg;
+        var tb = c as TextBox; if (tb != null) tb.BorderStyle = BorderStyle.FixedSingle;
+        var cb = c as ComboBox; if (cb != null) cb.FlatStyle = FlatStyle.Flat;
+        var lb = c as ListBox; if (lb != null) lb.BorderStyle = BorderStyle.FixedSingle;
+    }
+
+    void BuildUi()
+    {
+        int W = ClientSize.Width;
+        // ---- Header (slim) ----
+        var header = new Panel { Left = 0, Top = 0, Width = W, Height = 44, BackColor = Pn };
+        int hx = 12;
+        try
+        {
+            var lp = Path.Combine(AppContext.BaseDirectory, cfg.LogoFile ?? "");
+            if (File.Exists(lp)) { header.Controls.Add(new PictureBox { Left = 8, Top = 4, Width = 36, Height = 36, SizeMode = PictureBoxSizeMode.Zoom, Image = Image.FromFile(lp) }); hx = 52; }
+        }
+        catch { }
+        header.Controls.Add(new Label { Left = hx, Top = 8, Width = 500, Height = 28, AutoSize = false, Text = cfg.AppName, ForeColor = Fg, Font = new Font("Segoe UI", 13, FontStyle.Bold) });
+        btnLog = Btn("LOG", W - 84, 9, 70, 26);
+        btnLog.Click += (s, e) => ToggleLog();
+        header.Controls.Add(btnLog);
+        var hl = new Panel { Left = 0, Top = 44, Width = W, Height = 2, BackColor = accent };
+        Controls.Add(header); Controls.Add(hl);
+
+        // ---- Log window (chhupi rehti hai, LOG button se khulti hai) ----
+        txtLog = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Font = new Font("Consolas", 9), BackColor = Color.FromArgb(14, 20, 33), ForeColor = Fg, BorderStyle = BorderStyle.None };
+        logForm = new Form { Text = "Log", Width = 720, Height = 520, StartPosition = FormStartPosition.CenterParent, ShowInTaskbar = false, BackColor = BgC };
+        logForm.Controls.Add(txtLog);
+        logForm.FormClosing += (s, e) => { if (e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; logForm.Hide(); } };
+
+        // ================= LEFT COLUMN: phone =================
+        int LX = 14, LW = 360;
+        lblReg = Lbl("Register ho raha hai...", LX, 54, LW, 20, new Font("Segoe UI", 10, FontStyle.Bold));
+        var safe = new Label { Left = LX, Top = 76, Width = LW, Height = 22, AutoSize = false, BackColor = Color.FromArgb(24, 90, 66), ForeColor = Color.White, TextAlign = ContentAlignment.MiddleCenter, Font = new Font("Segoe UI", 9f, FontStyle.Bold), Text = "SAFE: Customer ko aapki awaaz / phrase kabhi NAHI jati" };
+
+        var lblAcc = Lbl("Account:", LX, 108, 55);
+        cmbUser = new ComboBox { Left = LX + 58, Top = 104, Width = 80, DropDownStyle = ComboBoxStyle.DropDown }; Dark(cmbUser);
+        var accounts = cfg.Accounts ?? new string[0];
+        cmbUser.Items.AddRange(accounts);
+        cmbUser.Text = cfg.User;
+        cmbUser.SelectedIndexChanged += (s, e) => ApplyAccount();
+        var lblPre = Lbl("Prefix:", LX + 144, 108, 42);
+        cmbPrefix = new ComboBox { Left = LX + 188, Top = 104, Width = 70, DropDownStyle = ComboBoxStyle.DropDown }; Dark(cmbPrefix);
+        var pres = new List<string>(cfg.Prefixes ?? new string[0]);
+        if (!string.IsNullOrWhiteSpace(cfg.Prefix) && !pres.Contains(cfg.Prefix)) pres.Insert(0, cfg.Prefix);
+        cmbPrefix.Items.AddRange(pres.ToArray());
+        cmbPrefix.Text = cfg.Prefix;
+        chkAuto = new CheckBox { Left = LX + 262, Top = 105, Width = 62, Height = 22, Text = "Auto", Checked = cfg.UsePrefix, Font = new Font("Segoe UI", 9, FontStyle.Bold), ForeColor = Fg };
+        new ToolTip().SetToolTip(chkAuto, "ON: app prefix khud lagati hai.  OFF: number poora (prefix ke saath) khud likhein.");
+        var btnApply = Btn("OK", LX + 328, 102, 32, 26);
+        btnApply.Click += (s, e) => ApplyAccount();
+        lblPreview = Lbl("", LX, 132, LW, 18, new Font("Segoe UI", 9, FontStyle.Bold), Dim);
+
+        btnL1 = Btn("LINE 1 - CLIENT", LX, 156, 176, 30);
+        btnL2 = Btn("LINE 2 - CUSTOMER", LX + 184, 156, 176, 30);
+        btnL1.Click += (s, e) => SelectLine(1);
+        btnL2.Click += (s, e) => SelectLine(2);
+        lblS1 = Lbl("Idle", LX, 190, 176, 18, null, Dim);
+        lblS2 = Lbl("Idle", LX + 184, 190, 176, 18, null, Dim);
+
+        txtNum = new TextBox { Left = LX, Top = 212, Width = 284, Font = new Font("Segoe UI", 13) }; Dark(txtNum);
+        txtNum.KeyDown += async (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; await DoCall(); } };
+        var del = Btn("Del", LX + 290, 212, 70, 30);
+        del.Click += (s, e) => { if (txtNum.Text.Length > 0) txtNum.Text = txtNum.Text.Substring(0, txtNum.Text.Length - 1); };
+        Controls.AddRange(new Control[] { lblReg, safe, lblAcc, cmbUser, lblPre, cmbPrefix, chkAuto, btnApply, lblPreview, btnL1, btnL2, lblS1, lblS2, txtNum, del });
+
+        string[] keys = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#" };
+        for (int i = 0; i < keys.Length; i++)
+        {
+            var k = keys[i];
+            var b = Btn(k, LX + (i % 3) * 122, 250 + (i / 3) * 30, 116, 26);
+            b.Click += (s, e) => { txtNum.Text += k; txtNum.Focus(); txtNum.SelectionStart = txtNum.Text.Length; };
+            Controls.Add(b);
+        }
+
+        btnCall = Btn("CALL", LX, 376, 176, 34, Color.SeaGreen, Color.White);
+        btnHang = Btn("HANGUP", LX + 184, 376, 176, 34, Color.Firebrick, Color.White);
+        btnCall.Click += async (s, e) => await DoCall();
+        btnHang.Click += (s, e) => { var l = sel == 1 ? line1 : line2; l?.Hangup(); };
+
+        // Do alag pause switch (sirf aap dabayen to badalte hain)
+        btnC2C1 = Btn("", LX, 416, 176, 40, Color.SeaGreen, Color.White);
+        btnC1C2 = Btn("", LX + 184, 416, 176, 40, Color.SeaGreen, Color.White);
+        btnC2C1.Click += (s, e) => ToggleC2C1();
+        btnC1C2.Click += (s, e) => ToggleC1C2();
+
+        var lm = Lbl("Microphone (VB-Cable ya apna mic)", LX, 464, LW, 18);
+        cmbMic = new ComboBox { Left = LX, Top = 482, Width = LW, DropDownStyle = ComboBoxStyle.DropDownList }; Dark(cmbMic);
+        var ls = Lbl("Speaker / Headphone", LX, 510, LW, 18);
+        cmbSpk = new ComboBox { Left = LX, Top = 528, Width = LW, DropDownStyle = ComboBoxStyle.DropDownList }; Dark(cmbSpk);
+        cmbMic.SelectedIndexChanged += (s, e) => RestartAudio();
+        cmbSpk.SelectedIndexChanged += (s, e) => RestartAudio();
+
+        btnMute = Btn("MIC MUTE: OFF (F1)", LX, 560, 176, 30);
+        btnMute.Click += (s, e) => ToggleMute();
+        btnCaption = Btn("CAPTION: OFF", LX + 184, 560, 176, 30);
+        btnCaption.Click += (s, e) => ToggleCaption();
+
+        var lb1 = Lbl("Line 1 (client) ko jati awaaz", LX, 598, LW, 16, new Font("Segoe UI", 8.5f), Dim);
+        pb1 = new ProgressBar { Left = LX, Top = 615, Width = LW, Height = 10 };
+        var lb2 = Lbl("Line 2 (customer) ko jati awaaz", LX, 630, LW, 16, new Font("Segoe UI", 8.5f), Dim);
+        pb2 = new ProgressBar { Left = LX, Top = 647, Width = LW, Height = 10 };
+        var tm = new System.Windows.Forms.Timer { Interval = 100 };
+        tm.Tick += (s, e) => { pb1.Value = Math.Min(100, mixer.Level1Out * 100 / 6000); pb2.Value = Math.Min(100, mixer.Level2Out * 100 / 6000); CheckRtp(line1, ref rtpWarn1, "Line1"); CheckRtp(line2, ref rtpWarn2, "Line2"); };
+        tm.Start();
+        Controls.AddRange(new Control[] { btnCall, btnHang, btnC2C1, btnC1C2, lm, cmbMic, ls, cmbSpk, btnMute, btnCaption, lb1, pb1, lb2, pb2 });
+
+        txtNum.TextChanged += (s, e) => UpdatePreview();
+        cmbPrefix.TextChanged += (s, e) => UpdatePreview();
+        chkAuto.CheckedChanged += (s, e) => UpdatePreview();
+        UpdatePreview();
+
+        // ================= MIDDLE COLUMN: caption + auto-answer =================
+        int MX = 390, MW = 330;
+        var lc = Lbl("CUSTOMER (Line 2) - LIVE CAPTION", MX, 54, MW, 20, new Font("Segoe UI", 10, FontStyle.Bold));
+        lblPartial = Lbl("", MX, 76, MW, 40, new Font("Segoe UI", 10, FontStyle.Italic), Dim);
+        txtCaption = new TextBox { Left = MX, Top = 118, Width = MW, Height = 282, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Font = new Font("Segoe UI", 12) }; Dark(txtCaption);
+        txtCaption.BackColor = Pn;
+
+        var lr = Lbl("AUTO-ANSWER", MX, 410, 200, 20, new Font("Segoe UI", 10, FontStyle.Bold));
+        btnAuto = Btn("", MX + 226, 406, 104, 26);
+        btnAuto.Click += (s, e) => ToggleAuto();
+        txtKw = new TextBox { Left = MX, Top = 436, Width = MW, Font = new Font("Segoe UI", 10) }; Dark(txtKw);
+        txtKw.PlaceholderText = "customer ye lafz bole (comma se): date of birth, birthday";
+        txtAns = new TextBox { Left = MX, Top = 464, Width = MW, Font = new Font("Segoe UI", 10) }; Dark(txtAns);
+        txtAns.PlaceholderText = "Line 1 ko kya sunana hai";
+        var btnRule = Btn("RULE ADD", MX, 492, 110, 26);
+        btnRule.Click += (s, e) => AddRule();
+        lblRules = Lbl("", MX + 118, 497, 210, 18, new Font("Segoe UI", 9), Dim);
+        lstRules = new ListBox { Left = MX, Top = 524, Width = MW, Height = 90, Font = new Font("Segoe UI", 9) }; Dark(lstRules);
+        lstRules.BackColor = Pn;
+        var rcm = new ContextMenuStrip();
+        rcm.Items.Add("Ye rule delete karein", null, (s, e) => { int ix = lstRules.SelectedIndex; if (ix >= 0 && ix < cfg.Rules.Count) { cfg.Rules.RemoveAt(ix); cfg.Save(); RefreshRules(); UpdateCacheLabel(); } });
+        lstRules.ContextMenuStrip = rcm;
+        lstRules.MouseDown += (s, e) => { if (e.Button == MouseButtons.Right) { int ix = lstRules.IndexFromPoint(e.Location); if (ix >= 0) lstRules.SelectedIndex = ix; } };
+        lblLast = Lbl("", MX, 620, MW, 36, new Font("Segoe UI", 8.5f), Dim);
+        Controls.AddRange(new Control[] { lc, lblPartial, txtCaption, lr, btnAuto, txtKw, txtAns, btnRule, lblRules, lstRules, lblLast });
+
+        // ================= RIGHT COLUMN: phrase pad =================
+        int RX = 736, RW = 390;
+        pnlTabs = new FlowLayoutPanel { Left = RX, Top = 54, Width = RW, Height = 32, WrapContents = false, AutoScroll = true, FlowDirection = FlowDirection.LeftToRight, BackColor = BgC };
+        pnlPhr = new FlowLayoutPanel { Left = RX, Top = 90, Width = RW, Height = 240, AutoScroll = true, FlowDirection = FlowDirection.LeftToRight, WrapContents = true, BackColor = BgC };
+
+        txtQuick = new TextBox { Left = RX, Top = 340, Width = 296, Font = new Font("Segoe UI", 11) }; Dark(txtQuick);
+        txtQuick.PlaceholderText = "likhein aur Enter  (jessica: hello)";
+        txtQuick.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; SpeakQuick(); } };
+        var btnSay = Btn("BOL", RX + 302, 339, 88, 30, Color.SeaGreen, Color.White);
+        btnSay.Click += (s, e) => SpeakQuick();
+        cmbCat = new ComboBox { Left = RX, Top = 376, Width = 222, DropDownStyle = ComboBoxStyle.DropDown }; Dark(cmbCat);
+        var btnAddBtn = Btn("+ Button", RX + 230, 375, 160, 28);
+        btnAddBtn.Click += (s, e) => AddButtonFromInput();
+        tip.SetToolTip(btnAddBtn, "Likha hua text hamesha ke liye button ban jata hai (is category mein)");
+
+        var lvh = Lbl("AWAAZ  (sirf Line 1 ko)   |   ▶ = sirf aap ko test", RX, 410, RW, 18, new Font("Segoe UI", 9, FontStyle.Bold), Dim);
+        pnlVoices = new FlowLayoutPanel { Left = RX, Top = 430, Width = RW, Height = 130, AutoScroll = true, FlowDirection = FlowDirection.TopDown, WrapContents = false, BackColor = BgC };
+
+        lblSpeed = Lbl("", RX, 564, RW, 18, new Font("Segoe UI", 9, FontStyle.Bold), Dim);
+        int sv = (int)Math.Round(cfg.Speed * 100);
+        tbSpeed = new TrackBar { Left = RX, Top = 582, Width = RW, Height = 28, Minimum = 70, Maximum = 130, TickStyle = TickStyle.None, SmallChange = 5, LargeChange = 5, Value = Math.Max(70, Math.Min(130, sv)), BackColor = BgC };
+        tbSpeed.Scroll += (s, e) => lblSpeed.Text = "Speed  " + (tbSpeed.Value / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "x";
+        tbSpeed.MouseUp += (s, e) => CommitSpeed();
+        tbSpeed.KeyUp += (s, e) => CommitSpeed();
+        lblSpeed.Text = "Speed  " + (tbSpeed.Value / 100.0).ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "x";
+
+        btnStop = Btn("STOP (Esc)", RX, 616, 110, 26, Color.Firebrick, Color.White);
+        btnStop.Click += (s, e) => mixer.StopPhrase();
+        btnHear = Btn("", RX + 118, 616, 272, 26);
+        btnHear.Click += (s, e) => ToggleHear();
+        lblCache = Lbl("", RX, 646, RW, 16, new Font("Segoe UI", 8.5f, FontStyle.Bold), Dim);
+        Controls.AddRange(new Control[] { pnlTabs, pnlPhr, txtQuick, btnSay, cmbCat, btnAddBtn, lvh, pnlVoices, lblSpeed, tbSpeed, btnStop, btnHear, lblCache });
+
+        PaintSwitches();
+        PaintAuto();
+        PaintHear();
+        RebuildTabs();
+        RebuildPhraseButtons();
+        RebuildVoices();
+        RefreshRules();
+        SelectLine(1);
+    }
+
+    void CommitSpeed()
+    {
+        double v = tbSpeed.Value / 100.0;
+        if (Math.Abs(v - cfg.Speed) < 0.001) return;
+        cfg.Speed = v;
+        try { cfg.Save(); } catch { }
+        RebuildPhraseButtons();     // nayi speed ki awaazein abhi bani nahi - gray dikhengi
+        PreloadMissing();           // background mein ban jayengi
+        Log("Speed " + v.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "x - awaazein dobara ban rahi hain");
+    }
+
+    void Log(string s)
+    {
+        UI(() =>
+        {
+            if (txtLog.TextLength > 30000) txtLog.Clear();
+            txtLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
+            bool noisy = (s.StartsWith("->") || s.StartsWith("<-")) && !(s.StartsWith("<- 4") || s.StartsWith("<- 5") || s.StartsWith("<- 6") || s.Contains("***"));
+            if (!noisy) lblLast.Text = s.Length > 120 ? s.Substring(0, 120) + "..." : s;
+        });
+    }
+
+    // Button / auto-answer ki awaaz: Line 1 ko hamesha jati hai. Mujhe sunai de ya nahi - yahan se. (Voice test ▶ hamesha sunai deta hai.)
+    void PaintHear()
+    {
+        btnHear.Text = mixer.MonitorPhrase ? "Button awaaz: MUJHE BHI SUNAO (Ctrl+H)" : "Button awaaz: SIRF LINE 1 (Ctrl+H)";
+        btnHear.BackColor = mixer.MonitorPhrase ? Color.Orange : Pn2;
+        btnHear.ForeColor = mixer.MonitorPhrase ? Color.Black : Fg;
+    }
+
+    void ToggleHear()
+    {
+        mixer.MonitorPhrase = !mixer.MonitorPhrase;
+        PaintHear();
+        Log(mixer.MonitorPhrase ? "Button awaaz ab aap ko bhi sunai degi" : "Button awaaz sirf Line 1 ko jayegi, aap ko repeat nahi sunai degi");
+    }
+
+    void ToggleLog()
+    {
+        if (logForm.Visible) logForm.Hide(); else logForm.Show(this);
+    }
+
+    void ToggleMute()
+    {
+        mixer.MicMuted = !mixer.MicMuted;
+        btnMute.Text = "MIC MUTE: " + (mixer.MicMuted ? "ON" : "OFF") + " (F1)";
+        btnMute.BackColor = mixer.MicMuted ? Color.Gold : Pn2;
+        btnMute.ForeColor = mixer.MicMuted ? Color.Black : Fg;
+        Log(mixer.MicMuted ? "MIC MUTE ON: aapka mic Line 1 ko nahi ja raha (phrase phir bhi jata hai)" : "MIC MUTE OFF");
+    }
+
+    void SelectLine(int n)
+    {
+        sel = n;
+        PaintLine(btnL1, n == 1, state1);
+        PaintLine(btnL2, n == 2, state2);
+    }
+
+    void PaintLine(Button b, bool selected, string state)
+    {
+        b.BackColor = state == "CONNECTED" ? Color.SeaGreen : selected ? accent : Pn2;
+        b.ForeColor = (state == "CONNECTED" || selected) ? Color.White : Fg;
+    }
+
+    void FillDevices()
+    {
+        cmbMic.Items.Add("Windows Default");
+        for (int i = 0; i < NAudio.Wave.WaveInEvent.DeviceCount; i++) cmbMic.Items.Add(NAudio.Wave.WaveInEvent.GetCapabilities(i).ProductName);
+        cmbSpk.Items.Add("Windows Default");
+        for (int i = 0; i < NAudio.Wave.WaveOut.DeviceCount; i++) cmbSpk.Items.Add(NAudio.Wave.WaveOut.GetCapabilities(i).ProductName);
+        cmbMic.SelectedIndex = Pick(cmbMic, cfg.MicName);
+        cmbSpk.SelectedIndex = Pick(cmbSpk, cfg.SpeakerName);
+    }
+
+    static int Pick(ComboBox c, string contains)
+    {
+        if (!string.IsNullOrWhiteSpace(contains))
+            for (int i = 0; i < c.Items.Count; i++)
+                if (c.Items[i].ToString().IndexOf(contains, StringComparison.OrdinalIgnoreCase) >= 0) return i;
+        return 0;
+    }
+
+    void RestartAudio()
+    {
+        if (loading) return;
+        try { mixer.Start(cmbMic.SelectedIndex - 1, cmbSpk.SelectedIndex - 1); Log("Audio chalu: mic=" + cmbMic.Text + " | speaker=" + cmbSpk.Text); }
+        catch (Exception ex) { Log("AUDIO ERROR: " + ex.Message); MessageBox.Show("Audio device start nahi hua: " + ex.Message); }
+    }
+
+    // ---- Hotkeys ----
+    void OnHotkey(KeyEventArgs e)
+    {
+        if (e.Control && e.KeyCode == Keys.H) { ToggleHear(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.F1) { ToggleMute(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.F2) { ToggleC2C1(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.F3) { ToggleC1C2(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.F4) { ToggleAuto(); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode >= Keys.F5 && e.KeyCode <= Keys.F12) { PlayPhrase((int)e.KeyCode - (int)Keys.F5); e.Handled = true; e.SuppressKeyPress = true; }
+        else if (e.KeyCode == Keys.Escape) { mixer.StopPhrase(); e.Handled = true; e.SuppressKeyPress = true; }
+    }
+
+    // ---- Do alag pause switch ----
+    void PaintSwitches()
+    {
+        btnC2C1.Text = "CUSTOMER -> CLIENT" + Environment.NewLine + (mixer.CustToClient ? "ON  (F2 = pause)" : "PAUSED  (F2 = resume)");
+        btnC2C1.BackColor = mixer.CustToClient ? Color.SeaGreen : Color.Orange;
+        btnC2C1.ForeColor = mixer.CustToClient ? Color.White : Color.Black;
+        btnC1C2.Text = "CLIENT -> CUSTOMER" + Environment.NewLine + (mixer.ClientToCust ? "ON  (F3 = pause)" : "PAUSED  (F3 = resume)");
+        btnC1C2.BackColor = mixer.ClientToCust ? Color.SeaGreen : Color.Orange;
+        btnC1C2.ForeColor = mixer.ClientToCust ? Color.White : Color.Black;
+    }
+
+    void ToggleC2C1()
+    {
+        mixer.CustToClient = !mixer.CustToClient;
+        PaintSwitches();
+        Log(mixer.CustToClient ? "CUSTOMER -> CLIENT ON: client customer ko sun sakta hai"
+                               : "CUSTOMER -> CLIENT PAUSED: client customer ko NAHI sun sakta (aap dono ko sunte hain)");
+    }
+
+    void ToggleC1C2()
+    {
+        mixer.ClientToCust = !mixer.ClientToCust;
+        PaintSwitches();
+        Log(mixer.ClientToCust ? "CLIENT -> CUSTOMER ON: customer client ko sun sakta hai"
+                               : "CLIENT -> CUSTOMER PAUSED: customer ko khamoshi jati hai");
+    }
+
+    // ---- Auto-answer ----
+    void PaintAuto()
+    {
+        btnAuto.Text = "AUTO " + (autoAnswer ? "ON" : "OFF") + " (F4)";
+        btnAuto.BackColor = autoAnswer ? Color.SeaGreen : Pn2;
+        btnAuto.ForeColor = autoAnswer ? Color.White : Fg;
+    }
+
+    void ToggleAuto()
+    {
+        autoAnswer = !autoAnswer;
+        cfg.AutoAnswer = autoAnswer;
+        PaintAuto();
+        Log(autoAnswer ? "AUTO-ANSWER ON (caption chalna zaroori hai)" : "AUTO-ANSWER OFF");
+        if (autoAnswer && !mixer.CaptionOn) StartCaption();
+    }
+
+    // Vosk thread se bulaya jata hai: customer ke lafz mein keyword mile to awaaz SIRF Line 1 ko.
+    void CheckRules(string text, bool final)
+    {
+        try
+        {
+            if (autoAnswer && !string.IsNullOrWhiteSpace(text))
+            {
+                var t = " " + Regex.Replace(text.ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim() + " ";
+                long now = Environment.TickCount64;
+                foreach (var r in cfg.Rules.ToArray())
+                {
+                    if (firedUtt.Contains(r) || r.Keywords == null || string.IsNullOrWhiteSpace(r.Say)) continue;
+                    string hit = null;
+                    foreach (var kw in r.Keywords)
+                    {
+                        var k = Regex.Replace((kw ?? "").ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
+                        if (k.Length > 0 && t.Contains(" " + k + " ")) { hit = k; break; }
+                    }
+                    if (hit == null) continue;
+                    firedUtt.Add(r);                                   // ek hi jumle mein dobara nahi
+                    if (ruleLast.TryGetValue(r, out var lastFire) && now - lastFire < r.CooldownSec * 1000L) continue;
+                    ruleLast[r] = now;
+                    var rr = r; var h = hit;
+                    var pcm = bank.TryGetCached(rr.Voice, rr.Say);
+                    if (pcm != null) mixer.PlayToLine1(pcm);
+                    else Task.Run(() => { var x = bank.Get(rr.Voice, rr.Say); if (x != null) mixer.PlayToLine1(x); });
+                    Log("AUTO-ANSWER -> Line 1:  [" + h + "]  " + rr.Say);
+                    UI(() => txtCaption.AppendText("   >>> Line 1 ko gaya: " + rr.Say + Environment.NewLine));
+                }
+            }
+        }
+        catch { }
+        if (final) firedUtt.Clear();
+    }
+
+    void AddRule()
+    {
+        var kws = (txtKw.Text ?? "").Split(',').Select(k => k.Trim().ToLowerInvariant()).Where(k => k.Length > 0).ToArray();
+        var say = (txtAns.Text ?? "").Trim();
+        if (kws.Length == 0 || say.Length == 0) { Log("Rule: lafz aur awaaz dono likhein"); return; }
+        var voice = curVoice;
+        cfg.Rules.Add(new RuleCfg { Keywords = kws, Say = say, Voice = voice });
+        cfg.Save();
+        txtKw.Clear(); txtAns.Clear();
+        RefreshRules();
+        UpdateCacheLabel();
+        Task.Run(() => { bank.Get(voice, say); UI(UpdateCacheLabel); });
+        Log("Rule add: " + string.Join(", ", kws) + "  ->  " + say);
+    }
+
+    void RefreshRules()
+    {
+        lstRules.Items.Clear();
+        foreach (var r in cfg.Rules.ToArray()) lstRules.Items.Add(string.Join(", ", r.Keywords ?? new string[0]) + "   ->   " + r.Say);
+        lblRules.Text = "Rules: " + cfg.Rules.Count + "   (right-click = delete)";
+    }
+
+    void UpdateCacheLabel()
+    {
+        int total = 0, ready = 0;
+        foreach (var p in cfg.Phrases.ToArray()) { total++; if (bank.TryGetCached(p.Voice, p.Text) != null) ready++; }
+        foreach (var r in cfg.Rules.ToArray()) { total++; if (bank.TryGetCached(r.Voice, r.Say) != null) ready++; }
+        lblCache.Text = "Awaaz tayyar: " + ready + "/" + total + "   |   " + bank.EngineLabel;
+    }
+
+    // ---- Phrase Pad ----
+    List<string> Cats()
+    {
+        var l = new List<string> { "Greetings", "Answers", "Closing", "General" };
+        foreach (var p in cfg.Phrases.ToArray())
+        {
+            var c = string.IsNullOrWhiteSpace(p.Cat) ? "General" : p.Cat.Trim();
+            if (!l.Contains(c)) l.Add(c);
+        }
+        return l;
+    }
+
+    void RebuildTabs()
+    {
+        pnlTabs.SuspendLayout();
+        var olds = pnlTabs.Controls.Cast<Control>().ToArray();
+        pnlTabs.Controls.Clear();
+        foreach (var o in olds) o.Dispose();
+        var names = new List<string> { "All" };
+        names.AddRange(Cats());
+        if (!names.Contains(curCat)) curCat = "All";
+        foreach (var n in names)
+        {
+            var name = n;
+            bool on = name == curCat;
+            var b = new Button { Text = name, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(0, 26), Margin = new Padding(0, 0, 6, 0), Padding = new Padding(6, 0, 6, 0), FlatStyle = FlatStyle.Flat, Font = new Font("Segoe UI", 9, FontStyle.Bold), BackColor = on ? Color.FromArgb(240, 244, 250) : Pn, ForeColor = on ? BgC : Dim, UseVisualStyleBackColor = false };
+            b.FlatAppearance.BorderColor = Bd;
+            b.Click += (s, e) => { curCat = name; if (name != "All") cmbCat.Text = name; RebuildTabs(); RebuildPhraseButtons(); };
+            pnlTabs.Controls.Add(b);
+        }
+        pnlTabs.ResumeLayout();
+        var cur = cmbCat.Text;
+        cmbCat.Items.Clear();
+        foreach (var c in Cats()) cmbCat.Items.Add(c);
+        cmbCat.Text = string.IsNullOrWhiteSpace(cur) ? (curCat == "All" ? "General" : curCat) : cur;
+    }
+
+    void RebuildPhraseButtons()
+    {
+        pnlPhr.SuspendLayout();
+        var olds = pnlPhr.Controls.Cast<Control>().ToArray();
+        pnlPhr.Controls.Clear();
+        foreach (var o in olds) o.Dispose();
+        for (int i = 0; i < cfg.Phrases.Count; i++)
+        {
+            int idx = i;
+            var p = cfg.Phrases[i];
+            var cat = string.IsNullOrWhiteSpace(p.Cat) ? "General" : p.Cat.Trim();
+            if (curCat != "All" && cat != curCat) continue;
+            bool ready = bank.TryGetCached(p.Voice, p.Text) != null;
+            var card = new PadCard
+            {
+                Width = 114, Height = 56, Margin = new Padding(3),
+                Title = string.IsNullOrWhiteSpace(p.Label) ? p.Text : p.Label,
+                Sub = p.Text,
+                Badge = idx < 8 ? "F" + (5 + idx) : "",
+                Ready = ready
+            };
+            card.Pressed += () => PlayPhrase(idx);
+            var cm = new ContextMenuStrip();
+            cm.Items.Add("Delete", null, (s, e) => { if (idx < cfg.Phrases.Count) { cfg.Phrases.RemoveAt(idx); cfg.Save(); RebuildTabs(); RebuildPhraseButtons(); } });
+            var mv = new ToolStripMenuItem("Move to category");
+            foreach (var cn in Cats())
+            {
+                var cc = cn;
+                mv.DropDownItems.Add(cc, null, (s, e) => { if (idx < cfg.Phrases.Count) { cfg.Phrases[idx].Cat = cc; cfg.Save(); RebuildTabs(); RebuildPhraseButtons(); } });
+            }
+            cm.Items.Add(mv);
+            var vv = new ToolStripMenuItem("Voice");
+            foreach (var vn in bank.VoiceNames())
+            {
+                var v2 = vn;
+                vv.DropDownItems.Add(v2, null, (s, e) => { if (idx < cfg.Phrases.Count) { cfg.Phrases[idx].Voice = v2; cfg.Save(); RebuildPhraseButtons(); PreloadMissing(); } });
+            }
+            cm.Items.Add(vv);
+            card.ContextMenuStrip = cm;
+            tip.SetToolTip(card, p.Text + "   [" + p.Voice + "]");
+            pnlPhr.Controls.Add(card);
+        }
+        pnlPhr.ResumeLayout();
+        UpdateCacheLabel();
+    }
+
+    void RebuildVoices()
+    {
+        pnlVoices.SuspendLayout();
+        var olds = pnlVoices.Controls.Cast<Control>().ToArray();
+        pnlVoices.Controls.Clear();
+        foreach (var o in olds) o.Dispose();
+        int n = 0;
+        foreach (var vn in bank.VoiceNames())
+        {
+            var name = vn;
+            var chip = new PadCard
+            {
+                Width = 366, Height = 38, Margin = new Padding(0, 0, 0, 4), Avatar = true, PlayZone = 36,
+                Title = char.ToUpperInvariant(name[0]) + name.Substring(1) + " (" + bank.Gender(name) + ")",
+                Sub = bank.Kind,
+                AvatarLetter = name.Substring(0, 1).ToUpperInvariant(),
+                AvatarColor = AvColors[n % AvColors.Length],
+                Selected = name == curVoice
+            };
+            chip.Pressed += () => { curVoice = name; cfg.DefaultVoice = name; RebuildVoices(); };
+            chip.PlayPressed += () => TestVoice(name);
+            pnlVoices.Controls.Add(chip);
+            n++;
+        }
+        pnlVoices.ResumeLayout();
+    }
+
+    // Test awaaz SIRF aap ko (speaker), Line 1 / Line 2 ko nahi jati.
+    void TestVoice(string name)
+    {
+        Task.Run(() =>
+        {
+            var p = bank.Get(name, "Hello, how can I help you today?");
+            if (p != null) mixer.PreviewToMe(p);
+        });
+    }
+
+    // Button dabate hi: awaaz RAM se seedha Line 1 ki taraf (network / TTS ka intezar nahi).
+    void PlayPhrase(int i)
+    {
+        if (i < 0 || i >= cfg.Phrases.Count) return;
+        var p = cfg.Phrases[i];
+        var pcm = bank.TryGetCached(p.Voice, p.Text);
+        if (pcm != null) { mixer.PlayToLine1(pcm); return; }
+        Log("Awaaz abhi ban rahi hai: " + p.Label);
+        Task.Run(() => { var x = bank.Get(p.Voice, p.Text); if (x != null) mixer.PlayToLine1(x); UI(RebuildPhraseButtons); });
+    }
+
+    void ParseVoiceText(string raw, out string voice, out string text)
+    {
+        voice = curVoice; text = raw;
+        int c = raw.IndexOf(':');
+        if (c > 0 && c <= 20 && bank.IsVoiceName(raw.Substring(0, c))) { voice = raw.Substring(0, c).Trim().ToLowerInvariant(); text = raw.Substring(c + 1).Trim(); }
+    }
+
+    // Likhein + Enter: us awaaz mein Line 1 ko. Pehli baar thora waqt (TTS), uske baad cache se foran. Button nahi banta.
+    void SpeakQuick()
+    {
+        var raw = (txtQuick.Text ?? "").Trim();
+        if (raw.Length == 0) return;
+        string voice, text;
+        ParseVoiceText(raw, out voice, out text);
+        if (text.Length == 0) return;
+        txtQuick.Clear();
+        var pcm = bank.TryGetCached(voice, text);
+        if (pcm != null) { mixer.PlayToLine1(pcm); return; }
+        Task.Run(() => { var x = bank.Get(voice, text); if (x != null) mixer.PlayToLine1(x); });
+    }
+
+    // "+ Button": likha hua text is category mein hamesha ke liye button ban jata hai.
+    void AddButtonFromInput()
+    {
+        var raw = (txtQuick.Text ?? "").Trim();
+        if (raw.Length == 0) return;
+        string voice, text;
+        ParseVoiceText(raw, out voice, out text);
+        if (text.Length == 0) return;
+        var cat = string.IsNullOrWhiteSpace(cmbCat.Text) ? "General" : cmbCat.Text.Trim();
+        cfg.Phrases.Add(new PhraseCfg { Label = text.Length > 22 ? text.Substring(0, 22) + "..." : text, Text = text, Voice = voice, Cat = cat });
+        cfg.Save();
+        txtQuick.Clear();
+        RebuildTabs();
+        RebuildPhraseButtons();
+        Task.Run(() => { bank.Get(voice, text); UI(RebuildPhraseButtons); });
+    }
+
+    // Jo awaazein disk par nahi hain unhe background mein bana lo; app khulte hi baqi sab pehle se RAM mein hoti hain.
+    void PreloadMissing()
+    {
+        Task.Run(() =>
+        {
+            var items = new List<Tuple<string, string>>();
+            foreach (var p in cfg.Phrases.ToArray()) items.Add(Tuple.Create(p.Voice, p.Text));
+            foreach (var r in cfg.Rules.ToArray()) items.Add(Tuple.Create(r.Voice, r.Say));
+            int made = 0;
+            foreach (var it in items)
+            {
+                if (string.IsNullOrWhiteSpace(it.Item2) || bank.TryGetCached(it.Item1, it.Item2) != null) continue;
+                bank.Get(it.Item1, it.Item2);
+                made++;
+                UI(UpdateCacheLabel);
+            }
+            if (made > 0) Log("Nayi awaazein bani: " + made + " (ab hamesha foran chalengi)");
+            UI(RebuildPhraseButtons);
+        });
+    }
+
+    // ---- Caption ----
+    void ToggleCaption()
+    {
+        if (mixer.CaptionOn)
+        {
+            mixer.CaptionOn = false;
+            btnCaption.Text = "CAPTION: OFF"; btnCaption.BackColor = Pn2; btnCaption.ForeColor = Fg;
+            if (autoAnswer) Log("DHYAN: caption OFF hone se AUTO-ANSWER bhi kaam nahi karega");
+            return;
+        }
+        StartCaption();
+    }
+
+    async void StartCaption()
+    {
+        if (!Captioner.ModelExists())
+        {
+            Log("CAPTION: 'model' folder nahi mila (exe ke saath Vosk model 'model' naam se rakhein)");
+            MessageBox.Show("'model' folder nahi mila. Vosk ka language model download karke exe ke saath 'model' naam ke folder mein rakhein.");
+            return;
+        }
+        try
+        {
+            btnCaption.Text = "CAPTION: loading...";
+            captioner.OnText -= OnCaption; captioner.OnText += OnCaption;
+            await Task.Run(() => captioner.Start(mixer.CaptionQueue));
+            mixer.CaptionOn = true;
+            btnCaption.Text = "CAPTION: ON"; btnCaption.BackColor = Color.SeaGreen; btnCaption.ForeColor = Color.White;
+        }
+        catch (Exception ex)
+        {
+            btnCaption.Text = "CAPTION: OFF";
+            Log("CAPTION ERROR: " + ex.Message);
+        }
+    }
+
+    void OnCaption(string text, bool final)
+    {
+        CheckRules(text, final);
+        UI(() =>
+        {
+            if (final) { txtCaption.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + text + Environment.NewLine + Environment.NewLine); lastPartial = ""; lblPartial.Text = ""; }
+            else if (text != lastPartial) { lastPartial = text; lblPartial.Text = text; }
+        });
+    }
+
+    void UI(Action a) { if (IsHandleCreated) BeginInvoke(a); }
+
+    // Call chal rahi ho aur doosri taraf se awaaz (RTP) 8 sec se na aaye to log mein bata do
+    void CheckRtp(SipLine l, ref bool warned, string nm)
+    {
+        if (l == null) return;
+        if (!l.UA.IsCallActive) { warned = false; return; }
+        double sec = l.Audio.SecondsSinceRtp;
+        if (sec > 8 && !warned) { warned = true; Log(nm + ": " + (int)sec + " sec se doosri taraf ki awaaz (RTP) nahi aa rahi - VPN/NAT/server check karein"); }
+        else if (sec < 2) warned = false;
+    }
+
+    // ---- Account / Prefix ----
+    void ApplyAccount()
+    {
+        if (loading || transport == null) return;
+        var newUser = cmbUser.Text.Trim();
+        bool userChanged = newUser != cfg.User;
+        bool onCall = (line1 != null && line1.Busy) || (line2 != null && line2.Busy);
+        if (onCall && userChanged)
+        {
+            // Call ke dauran dobara register karne se server call kaat sakta hai
+            Log("Call chal rahi hai - account abhi nahi badla (warna call kat sakti hai). Call ke baad badlein.");
+            cmbUser.Text = cfg.User;
+            return;
+        }
+        cfg.User = newUser;
+        cfg.Prefix = cmbPrefix.Text.Trim();
+        cfg.UsePrefix = chkAuto.Checked;
+        cfg.Save();
+        bool regOk = lblReg.ForeColor == Color.SeaGreen;
+        if (onCall || (!userChanged && regOk && reg != null))
+        {
+            Log("Prefix save ho gaya: " + cfg.Prefix + "  (register dobara nahi kiya)");
+            return;
+        }
+        Log("Account=" + cfg.User + "  Prefix=" + cfg.Prefix + "  (dobara register)");
+        StartReg();
+    }
+
+    static string CleanNumber(string s)
+    {
+        return new string((s ?? "").Where(ch => char.IsDigit(ch) || ch == '*' || ch == '#').ToArray());
+    }
+
+    string PrefixNow() { return chkAuto.Checked ? CleanNumber(cmbPrefix.Text) : ""; }
+
+    void UpdatePreview()
+    {
+        if (lblPreview == null) return;
+        var num = CleanNumber(txtNum.Text);
+        lblPreview.Text = num.Length == 0 ? (chkAuto.Checked ? "Prefix auto ON: " + PrefixNow() + " + number" : "Prefix auto OFF: number poora khud likhein")
+                                          : "Dial hoga:  " + PrefixNow() + num;
+    }
+
+    void RememberPrefix(string p)
+    {
+        if (string.IsNullOrWhiteSpace(p)) return;
+        if (!cmbPrefix.Items.Contains(p)) cmbPrefix.Items.Insert(0, p);
+        var list = new List<string>();
+        foreach (var it in cmbPrefix.Items) list.Add(it.ToString());
+        cfg.Prefixes = list.Take(15).ToArray();
+    }
+
+    async Task DoCall()
+    {
+        var l = sel == 1 ? line1 : line2;
+        if (l == null) { Log("SIP abhi start nahi hua"); return; }
+        var num = CleanNumber(txtNum.Text);
+        if (num.Length == 0) { Log("Number likhein"); return; }
+        var pre = PrefixNow();
+        cfg.Prefix = cmbPrefix.Text.Trim();
+        cfg.UsePrefix = chkAuto.Checked;
+        cfg.User = cmbUser.Text.Trim();
+        if (chkAuto.Checked) RememberPrefix(cfg.Prefix);
+        cfg.Save();
+        await l.Dial(pre + num);
+    }
+
+    void StartReg()
+    {
+        try { reg?.Stop(); } catch { }
+        lblReg.Text = "Register ho raha hai..."; lblReg.ForeColor = Fg;
+        reg = new SIPRegistrationUserAgent(transport, cfg.User, cfg.Password, cfg.Server, 120);
+        reg.RegistrationSuccessful += (uri, resp) => UI(() => { lblReg.Text = "Registered: " + cfg.User; lblReg.ForeColor = Color.SeaGreen; });
+        reg.RegistrationFailed += (uri, resp, err) => UI(() => { lblReg.Text = "Register FAIL: " + err; lblReg.ForeColor = Color.Firebrick; });
+        reg.Start();
+    }
+
+    async Task StartAsync()
+    {
+        try { FillDevices(); } catch (Exception ex) { Log("Device list error: " + ex.Message); }
+        loading = false;
+
+        mixer.Log = Log;
+        bank.Log = Log;
+
+        // 1) SIP pehle (audio ki koi dikkat SIP ko rokay nahi)
+        try
+        {
+            transport = new SIPTransport();
+            transport.AddSIPChannel(new SIPUDPChannel(new IPEndPoint(IPAddress.Any, 0)));
+            transport.SIPRequestOutTraceEvent += (lep, rep, req) => Log("-> " + req.Method + " " + req.URI);
+            transport.SIPRequestInTraceEvent += (lep, rep, req) => Log("<- " + req.Method + (req.Method == SIPMethodsEnum.BYE ? "   *** DOOSRI TARAF/SERVER NE BYE BHEJA ***" : ""));
+            transport.SIPResponseInTraceEvent += (lep, rep, resp) => Log("<- " + resp.StatusCode + " " + resp.ReasonPhrase + "  (" + resp.Header.CSeqMethod + ")");
+            line1 = new SipLine("Line1", transport, cfg, mixer.Line1);
+            line2 = new SipLine("Line2", transport, cfg, mixer.Line2);
+            line1.Log = Log; line2.Log = Log;
+            line1.CanAnswer = () => sel == 1;
+            line2.CanAnswer = () => sel == 2;
+            line1.StateChanged += st => UI(() => { state1 = st; lblS1.Text = st; SelectLine(sel); });
+            line2.StateChanged += st => UI(() => { state2 = st; lblS2.Text = st; SelectLine(sel); });
+            StartReg();
+        }
+        catch (Exception ex)
+        {
+            lblReg.Text = "SIP Error: " + ex.Message; lblReg.ForeColor = Color.Firebrick;
+            Log("SIP ERROR: " + ex.Message);
+        }
+
+        // 2) Audio
+        RestartAudio();
+
+        // 3) Caption automatic (agar model folder maujood ho)
+        if (Captioner.ModelExists()) StartCaption();
+        else Log("CAPTION: 'model' folder nahi mila, caption band rahegi");
+
+        // 4) Phrase / rule awaazein (jo cache mein nahi, background mein ban jayengi)
+        bank.Log = Log;
+        Task.Run(() =>
+        {
+            bank.InitAsync().Wait();                 // Kokoro offline server start (agar files hon)
+            UI(() => { RebuildPhraseButtons(); RebuildVoices(); });
+            PreloadMissing();
+        });
+
+        await Task.CompletedTask;
+    }
+}

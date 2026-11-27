@@ -1,0 +1,5 @@
+config.json
+model/
+voicecache/
+kokoro.onnx
+voices.bin
